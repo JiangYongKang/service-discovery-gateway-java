@@ -35,18 +35,33 @@ public class DemoController {
         this.forwarder = forwarder;
     }
 
-    /** 注册 count 个实例，实例ID为 inst-1..inst-count。 */
+    /** 注册 count 个实例，实例ID为 inst-1..inst-count；可带权重与并发在途上限（0=不限）。 */
     @PostMapping("/register")
-    public Map<String, Object> register(@RequestParam(defaultValue = "3") int count) {
+    public Map<String, Object> register(@RequestParam(defaultValue = "3") int count,
+                                        @RequestParam(defaultValue = "1") int weight,
+                                        @RequestParam(defaultValue = "0") int maxInFlight) {
         int created = 0;
         for (int i = 1; i <= count; i++) {
             String id = "inst-" + i;
-            if (registry.register(DiscoveryConfig.DEMO_SERVICE, id)) {
+            if (registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxInFlight)) {
                 created++;
             }
             downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
         }
         return Map.of("requested", count, "newlyRegistered", created,
+                "weight", weight, "maxInFlight", maxInFlight,
+                "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
+    }
+
+    /** 按实例注册（灰度场景：不同实例不同权重/容量）。 */
+    @PostMapping("/instances/{id}/register")
+    public Map<String, Object> registerOne(@PathVariable String id,
+                                           @RequestParam(defaultValue = "1") int weight,
+                                           @RequestParam(defaultValue = "0") int maxInFlight) {
+        boolean created = registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxInFlight);
+        downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
+        return Map.of("instance", id, "newlyRegistered", created,
+                "weight", weight, "maxInFlight", maxInFlight,
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 
@@ -99,5 +114,14 @@ public class DemoController {
         state.put("circuits", circuits);
         state.put("downstreamInvokeCounts", downstream.snapshotCounts());
         return state;
+    }
+
+    /**
+     * 只读运行状态视图：每实例熔断状态、是否半开探测中、最近失败类型分布、
+     * 被熔断/满载跳过累计次数、权重与在途容量。查看不改变任何运行状态。
+     */
+    @GetMapping("/runtime")
+    public GatewayForwarder.RuntimeView runtime() {
+        return forwarder.runtimeView(DiscoveryConfig.DEMO_SERVICE);
     }
 }

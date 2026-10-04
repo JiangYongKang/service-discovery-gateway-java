@@ -8,9 +8,12 @@ import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.He
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.InMemoryServiceRegistry;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.ServiceRegistry;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.LoadBalancer;
-import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.RoundRobinLoadBalancer;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.WeightedRoundRobinLoadBalancer;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.HealthConfig;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.RetryPolicy;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.RetryBudget;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.RetryBudgetConfig;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.SlidingWindowRetryBudget;
 import jakarta.annotation.PreDestroy;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -46,13 +49,26 @@ public class DiscoveryConfig {
     }
 
     @Bean
+    public RetryBudgetConfig retryBudgetConfig() {
+        // 默认不启用重试预算（与既有行为一致）；本地验证时可改为
+        // new RetryBudgetConfig(10_000, 20, 0.5) 之类的窗口限制
+        return RetryBudgetConfig.disabled();
+    }
+
+    @Bean
+    public RetryBudget retryBudget(RetryBudgetConfig retryBudgetConfig) {
+        return new SlidingWindowRetryBudget(retryBudgetConfig);
+    }
+
+    @Bean
     public ServiceRegistry serviceRegistry(HealthConfig healthConfig, DownstreamHandler downstream) {
         return new InMemoryServiceRegistry(healthConfig, downstream);
     }
 
     @Bean
     public LoadBalancer loadBalancer() {
-        return new RoundRobinLoadBalancer();
+        // 平滑加权轮询：等权重（默认）时严格退化为普通轮询，行为与之前一致
+        return new WeightedRoundRobinLoadBalancer();
     }
 
     @Bean
@@ -60,9 +76,17 @@ public class DiscoveryConfig {
                                              LoadBalancer loadBalancer,
                                              DownstreamHandler downstream,
                                              RetryPolicy retryPolicy,
-                                             CircuitBreakerConfig circuitConfig) {
+                                             CircuitBreakerConfig circuitConfig,
+                                             RetryBudget retryBudget) {
         return new GatewayForwarder(registry, loadBalancer, downstream, retryPolicy,
-                circuitConfig, System::currentTimeMillis);
+                circuitConfig, System::currentTimeMillis,
+                registry.config().probeTimeoutMillis(), millis -> {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, retryBudget);
     }
 
     @Bean

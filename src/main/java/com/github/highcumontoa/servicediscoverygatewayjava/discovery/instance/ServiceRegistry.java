@@ -13,6 +13,14 @@ public interface ServiceRegistry {
     /** 注册实例（幂等：已存在（健康或摘除中）时忽略并返回 false）。 */
     boolean register(String serviceName, String instanceId);
 
+    /**
+     * 带灰度与容量维度的注册。
+     *
+     * @param weight      流量分摊权重（>=1）
+     * @param maxInFlight 并发在途上限（0 表示不限）
+     */
+    boolean register(String serviceName, String instanceId, int weight, int maxInFlight);
+
     /** 注销实例：之后永不再参与转发。返回是否真实注销。 */
     boolean deregister(String serviceName, String instanceId);
 
