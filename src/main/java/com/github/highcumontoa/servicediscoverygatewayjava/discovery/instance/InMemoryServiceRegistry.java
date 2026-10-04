@@ -49,13 +49,21 @@ public class InMemoryServiceRegistry implements ServiceRegistry {
 
     @Override
     public boolean register(String serviceName, String instanceId) {
+        return register(serviceName, instanceId, 1, ServiceInstance.UNLIMITED_CONCURRENCY);
+    }
+
+    @Override
+    public boolean register(String serviceName, String instanceId, int weight, int maxConcurrency) {
         Map<String, ServiceInstance> instances =
                 services.computeIfAbsent(serviceName, k -> new ConcurrentHashMap<>());
         // putIfAbsent 保证并发注册同一实例只有一个胜出，绝不重复计入
-        ServiceInstance created = instances.putIfAbsent(instanceId, new ServiceInstance(serviceName, instanceId));
+        ServiceInstance created = instances.putIfAbsent(instanceId,
+                new ServiceInstance(serviceName, instanceId, weight, maxConcurrency));
         if (created == null) {
-            log.info("register input: service={}, instance={} -> result=REGISTERED(initial HEALTHY)",
-                    serviceName, instanceId);
+            log.info("register input: service={}, instance={}, weight={}, maxConcurrency={} -> "
+                            + "result=REGISTERED(initial HEALTHY)",
+                    serviceName, instanceId, Math.max(1, weight),
+                    maxConcurrency <= 0 ? "unlimited" : maxConcurrency);
             return true;
         }
         log.info("register input: service={}, instance={} -> result=IGNORED(already exists,status={})",

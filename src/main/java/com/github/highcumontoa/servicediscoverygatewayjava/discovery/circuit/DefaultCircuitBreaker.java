@@ -1,6 +1,7 @@
 package com.github.highcumontoa.servicediscoverygatewayjava.discovery.circuit;
 
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.CircuitState;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.FailureType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,6 +26,8 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
     private int consecutiveFailures = 0;
     private int halfOpenSuccesses = 0;
     private long openedAtMillis = 0L;
+    private final java.util.EnumMap<FailureType, Integer> failureTypeCounts =
+            new java.util.EnumMap<>(FailureType.class);
 
     public DefaultCircuitBreaker(String instanceId, CircuitBreakerConfig config) {
         this.instanceId = instanceId;
@@ -94,6 +97,14 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
 
     @Override
     public synchronized void recordFailure(long now) {
+        recordFailure(now, null);
+    }
+
+    @Override
+    public synchronized void recordFailure(long now, FailureType type) {
+        if (type != null) {
+            failureTypeCounts.merge(type, 1, Integer::sum);
+        }
         if (state == CircuitState.HALF_OPEN) {
             // 半开探测失败：保持熔断，重新计时
             state = CircuitState.OPEN;
@@ -113,6 +124,12 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
             log.debug("circuit[{}] recorded failure {}/{} (state={})",
                     instanceId, consecutiveFailures, config.failureThreshold(), state);
         }
+    }
+
+    /** 只读：失败类型分布快照（拷贝，不影响内部状态）。 */
+    @Override
+    public synchronized java.util.Map<FailureType, Integer> failureTypeDistribution() {
+        return java.util.Collections.unmodifiableMap(new java.util.EnumMap<>(failureTypeCounts));
     }
 
     /** 测试辅助：直接置为 OPEN 并开始计时。 */

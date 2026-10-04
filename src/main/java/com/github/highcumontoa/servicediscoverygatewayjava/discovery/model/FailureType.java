@@ -7,5 +7,6 @@ public enum FailureType {
     DOWNSTREAM_ERROR,
     NO_HEALTHY_INSTANCE,
     CIRCUIT_OPEN,
+    CAPACITY_FULL,
     RETRY_EXHAUSTED
 }

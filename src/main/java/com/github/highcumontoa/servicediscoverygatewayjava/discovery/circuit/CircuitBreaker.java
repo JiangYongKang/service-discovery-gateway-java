@@ -1,6 +1,9 @@
 package com.github.highcumontoa.servicediscoverygatewayjava.discovery.circuit;
 
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.CircuitState;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.FailureType;
+
+import java.util.Map;
 
 /**
  * 单实例熔断器（CLOSED -> OPEN -> HALF_OPEN -> CLOSED/OPEN）。
@@ -23,4 +26,19 @@ public interface CircuitBreaker {
 
     /** 记录一次失败（HALF_OPEN 中立即回到 OPEN）。 */
     void recordFailure(long now);
+
+    /** 记录一次带类型的失败（用于只读视图的失败类型分布统计）。 */
+    default void recordFailure(long now, FailureType type) {
+        recordFailure(now);
+    }
+
+    /** 是否正处于半开探测中（只读，不改变状态）。 */
+    default boolean isProbing() {
+        return state() == CircuitState.HALF_OPEN;
+    }
+
+    /** 最近失败类型分布（只读快照，不改变状态）。 */
+    default Map<FailureType, Integer> failureTypeDistribution() {
+        return Map.of();
+    }
 }

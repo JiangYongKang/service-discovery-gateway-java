@@ -13,18 +13,24 @@ import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.Downs
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.FailureType;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.ForwardOutcome;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.ForwardRequest;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.RetryBudgetPolicy;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.RetryPolicy;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.ServiceSnapshot;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.IdempotencyDeduplicator;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.InMemoryIdempotencyDeduplicator;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.RetryBudget;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.SlidingWindowRetryBudget;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 /**
@@ -33,12 +39,19 @@ import java.util.function.LongSupplier;
  * 一次转发的完整判定链（每一步都打印输入/选择结果/判定依据）：
  * 1. 幂等去重：同键并发请求只产生一次真实执行链（含其内部重试）；
  * 2. 每轮都从注册中心取最新健康快照——刚摘除/注销的实例本轮即不可见；
- * 3. 负载均衡在“健康且熔断放行且本次未试过”的候选中选择，重试排除已试实例；
+ * 3. 容量预筛：在途请求已达 maxConcurrency 的实例本轮跳过（CAPACITY_FULL），
+ *    其权重份额按比例让给其余有余量实例；名额归还后自动回到分发；
  * 4. 实例级熔断器 OPEN 时直接跳过（CIRCUIT_OPEN），不向下游放大流量；
- * 5. 执行并区分失败类型：TIMEOUT / CONNECTION_REFUSED / DOWNSTREAM_ERROR；
- * 6. 仅可安全重试、且失败属传输类、且未超 maxAttempts、且还有别的健康实例时才退避重试；
+ *    冷却到期的翻牌（OPEN->HALF_OPEN）只发生在有余量的实例上，且翻牌实例本轮
+ *    优先被选中——保证冷却到点后它一定真实收到一次下游探测请求；
+ * 5. 负载均衡在“健康且有余量且熔断放行且本次未试过”的候选中按权重分摊；
+ *    选中后以 CAS 原子占用在途名额，请求结束（成功/超时/下游报错）必归还；
+ * 6. 执行并区分失败类型：TIMEOUT / CONNECTION_REFUSED / DOWNSTREAM_ERROR；
+ * 7. 仅可安全重试、且失败属传输类、且未超 maxAttempts、且还有别的健康实例、
+ *    且重试预算（滑动窗口总量/占比）未耗尽时才退避重试；
+ *    预算只拦截自动重试，首发请求永远照常发出；
  *    非可重试请求绝不静默重试（只执行一次）；
- * 7. 熔断统计只计入“真实执行过”的尝试；熔断打开本身不计为下游失败。
+ * 8. 熔断统计只计入“真实执行过”的尝试；熔断打开本身不计为下游失败。
  */
 public class GatewayForwarder {
 
@@ -52,10 +65,15 @@ public class GatewayForwarder {
     private final LongSupplier clock;
     private final long requestTimeoutMillis;
     private final Sleeper sleeper;
+    private final RetryBudget retryBudget;
     private final IdempotencyDeduplicator<ForwardOutcome> deduplicator =
             new InMemoryIdempotencyDeduplicator<>();
 
     private final Map<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
+    /** 只读统计：各实例因熔断打开被跳过的累计次数。 */
+    private final Map<String, AtomicLong> circuitOpenSkips = new ConcurrentHashMap<>();
+    /** 只读统计：各实例因满载被跳过的累计次数。 */
+    private final Map<String, AtomicLong> capacityFullSkips = new ConcurrentHashMap<>();
 
     public GatewayForwarder(ServiceRegistry registry,
                             LoadBalancer loadBalancer,
@@ -75,13 +93,28 @@ public class GatewayForwarder {
 
     /** 测试接缝：可注入时钟、请求超时与退避等待（测试中零等待）。 */
     public GatewayForwarder(ServiceRegistry registry,
-                     LoadBalancer loadBalancer,
-                     DownstreamHandler downstream,
-                     RetryPolicy retryPolicy,
-                     CircuitBreakerConfig circuitConfig,
-                     LongSupplier clock,
-                     long requestTimeoutMillis,
-                     Sleeper sleeper) {
+                            LoadBalancer loadBalancer,
+                            DownstreamHandler downstream,
+                            RetryPolicy retryPolicy,
+                            CircuitBreakerConfig circuitConfig,
+                            LongSupplier clock,
+                            long requestTimeoutMillis,
+                            Sleeper sleeper) {
+        this(registry, loadBalancer, downstream, retryPolicy, circuitConfig, clock,
+                requestTimeoutMillis, sleeper,
+                new SlidingWindowRetryBudget(RetryBudgetPolicy.disabled()));
+    }
+
+    /** 完整接缝：额外注入按服务的重试预算。 */
+    public GatewayForwarder(ServiceRegistry registry,
+                            LoadBalancer loadBalancer,
+                            DownstreamHandler downstream,
+                            RetryPolicy retryPolicy,
+                            CircuitBreakerConfig circuitConfig,
+                            LongSupplier clock,
+                            long requestTimeoutMillis,
+                            Sleeper sleeper,
+                            RetryBudget retryBudget) {
         this.registry = registry;
         this.loadBalancer = loadBalancer;
         this.downstream = downstream;
@@ -90,6 +123,7 @@ public class GatewayForwarder {
         this.clock = clock;
         this.requestTimeoutMillis = requestTimeoutMillis;
         this.sleeper = sleeper;
+        this.retryBudget = retryBudget;
     }
 
     public ForwardOutcome forward(ForwardRequest request) {
@@ -123,34 +157,75 @@ public class GatewayForwarder {
         int maxAttempts = request.retryable() ? retryPolicy.maxAttempts() : 1;
         FailureType lastFailureType = null;
         String lastFailureDetail = null;
+        // 每个逻辑请求只记一次首发（重试预算的占比分母）
+        retryBudget.recordRequest(request.serviceName(), clock.getAsLong());
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             long now = clock.getAsLong();
             List<ServiceInstance> healthy = registry.healthyInstances(request.serviceName());
-            // 在最新健康快照上剔除熔断未放行的实例
-            List<ServiceInstance> passable = new ArrayList<>();
+
+            // 容量预筛（先于熔断判定）：满载实例本轮跳过，且不对它做熔断翻牌，
+            // 等它空下来再自动回到分发与探测链路
+            List<ServiceInstance> withCapacity = new ArrayList<>();
             for (ServiceInstance instance : healthy) {
+                if (instance.hasCapacity()) {
+                    withCapacity.add(instance);
+                } else {
+                    capacityFullSkips.computeIfAbsent(instance.instanceId(),
+                            k -> new AtomicLong()).incrementAndGet();
+                    log.info("skip instance={}: CAPACITY_FULL (inFlight={}/max={}), "
+                                    + "share redistributed to instances with free slots",
+                            instance.instanceId(), instance.inFlight(), instance.maxConcurrency());
+                }
+            }
+
+            // 在有余量的快照上剔除熔断未放行的实例；冷却到期的翻牌实例记为探测候选
+            List<ServiceInstance> passable = new ArrayList<>();
+            ServiceInstance probeCandidate = null;
+            for (ServiceInstance instance : withCapacity) {
                 CircuitBreaker breaker = breakerFor(instance.instanceId());
                 if (breaker.allowRequest(now)) {
                     passable.add(instance);
+                    if (breaker.state() == CircuitState.HALF_OPEN) {
+                        // 本次调用触发了 OPEN->HALF_OPEN 翻牌：它必须真的收到探测请求
+                        probeCandidate = instance;
+                    }
                 } else {
+                    circuitOpenSkips.computeIfAbsent(instance.instanceId(),
+                            k -> new AtomicLong()).incrementAndGet();
                     log.info("skip instance={}: circuit={} (CIRCUIT_OPEN, fail-fast, no downstream pressure)",
                             instance.instanceId(), breaker.state());
                 }
             }
-            ServiceInstance chosen = loadBalancer.choose(request.serviceName(), passable, triedInstances);
+
+            ServiceInstance chosen = selectInstance(request, passable, probeCandidate, triedInstances);
             if (chosen == null) {
-                FailureType type = !healthy.isEmpty() && passable.isEmpty()
-                        ? FailureType.CIRCUIT_OPEN : FailureType.NO_HEALTHY_INSTANCE;
+                FailureType type;
+                if (healthy.isEmpty()) {
+                    type = FailureType.NO_HEALTHY_INSTANCE;
+                } else if (withCapacity.isEmpty()) {
+                    type = FailureType.CAPACITY_FULL;
+                } else if (passable.isEmpty()) {
+                    type = FailureType.CIRCUIT_OPEN;
+                } else {
+                    type = FailureType.CAPACITY_FULL;
+                }
                 String reason = "no candidate on attempt " + attempt + "/" + maxAttempts
-                        + " (healthy=" + healthy.size() + ", passableCircuits=" + passable.size()
+                        + " (healthy=" + healthy.size() + ", withCapacity=" + withCapacity.size()
+                        + ", passableCircuits=" + passable.size()
                         + ", triedThisRequest=" + triedInstances + ")";
                 return fail(type, reason, attempts);
             }
 
             triedInstances.add(chosen.instanceId());
             CircuitBreaker chosenBreaker = breakerFor(chosen.instanceId());
-            AttemptResult result = invokeOnce(chosen, request, attempt, attempts);
+            AttemptResult result;
+            try {
+                result = invokeOnce(chosen, request, attempt, attempts);
+            } finally {
+                // 无论成功、超时还是下游报错都必须归还名额，杜绝计数泄漏
+                chosen.releaseInFlight();
+            }
 
             switch (result.kind()) {
                 case SUCCESS -> {
@@ -159,13 +234,13 @@ public class GatewayForwarder {
                             "succeeded on attempt " + attempt, List.copyOf(attempts));
                 }
                 case DOWNSTREAM_5XX -> {
-                    chosenBreaker.recordFailure(clock.getAsLong());
+                    chosenBreaker.recordFailure(clock.getAsLong(), FailureType.DOWNSTREAM_ERROR);
                     lastFailureType = FailureType.DOWNSTREAM_ERROR;
                     lastFailureDetail = "instance=" + chosen.instanceId()
                             + " returned " + result.response().statusCode();
                 }
                 case TRANSPORT_FAILURE -> {
-                    chosenBreaker.recordFailure(clock.getAsLong());
+                    chosenBreaker.recordFailure(clock.getAsLong(), result.failureType());
                     lastFailureType = result.failureType();
                     lastFailureDetail = "instance=" + chosen.instanceId() + " -> " + result.failureType();
                 }
@@ -173,6 +248,7 @@ public class GatewayForwarder {
 
             // 判定顺序：不可重试 -> 非传输类失败 -> 次数耗尽（统一归并 RETRY_EXHAUSTED，
             // 明细保留真实失败类型）-> 没有别的可用实例（避免无意义重试放大）
+            // -> 重试预算耗尽（只拦自动重试，首发不受影响）
             if (!request.retryable()) {
                 return fail(lastFailureType,
                         giveUpReason(request, attempt, maxAttempts, result, lastFailureDetail, triedInstances),
@@ -195,10 +271,18 @@ public class GatewayForwarder {
                         giveUpReason(request, attempt, maxAttempts, result, lastFailureDetail, triedInstances),
                         attempts);
             }
+            RetryBudget.RetryDecision budgetDecision =
+                    retryBudget.tryAcquireRetry(request.serviceName(), clock.getAsLong());
+            if (!budgetDecision.allowed()) {
+                return fail(lastFailureType,
+                        "auto-retry suppressed by retry budget: " + budgetDecision.reason()
+                                + " (" + lastFailureDetail + ")", attempts);
+            }
             long backoff = retryPolicy.backoffMillis() * attempt;
             log.info("retry decision: failure={} is transport-retriable, attempt {}/{} used, "
-                            + "backoff={}ms (linear), tried={}",
-                    lastFailureType, attempt, maxAttempts, backoff, triedInstances);
+                            + "backoff={}ms (linear), tried={}, budget={}",
+                    lastFailureType, attempt, maxAttempts, backoff, triedInstances,
+                    budgetDecision.reason());
             if (backoff > 0) {
                 sleeper.sleep(backoff);
             }
@@ -207,6 +291,49 @@ public class GatewayForwarder {
         return fail(FailureType.RETRY_EXHAUSTED,
                 "retries exhausted after " + maxAttempts + " attempts; lastFailure="
                         + lastFailureType + " (" + lastFailureDetail + ")", attempts);
+    }
+
+    /**
+     * 选择本轮实例并以 CAS 原子占用在途名额：
+     * - 熔断翻牌的探测候选优先（冷却到点后必须真的发出探测）；
+     * - 其余走负载均衡按权重分摊；
+     * - 选中后 tryAcquireInFlight 失败（名额被并发抢走）则本轮排除该实例重选，
+     *   名额计数绝不超发。
+     */
+    private ServiceInstance selectInstance(ForwardRequest request, List<ServiceInstance> passable,
+                                           ServiceInstance probeCandidate, Set<String> triedInstances) {
+        Set<String> excluded = new HashSet<>(triedInstances);
+        if (probeCandidate != null && !triedInstances.contains(probeCandidate.instanceId())) {
+            if (probeCandidate.tryAcquireInFlight()) {
+                log.info("probe priority: instance={} just flipped OPEN->HALF_OPEN, "
+                                + "selected as the single trial request (inFlight={}/{})",
+                        probeCandidate.instanceId(), probeCandidate.inFlight(),
+                        probeCandidate.maxConcurrency() <= 0 ? "unlimited" : probeCandidate.maxConcurrency());
+                return probeCandidate;
+            }
+            excluded.add(probeCandidate.instanceId());
+            capacityFullSkips.computeIfAbsent(probeCandidate.instanceId(),
+                    k -> new AtomicLong()).incrementAndGet();
+            log.info("skip instance={}: CAPACITY_FULL on probe acquire (raced), retry selection",
+                    probeCandidate.instanceId());
+        }
+        while (true) {
+            ServiceInstance candidate =
+                    loadBalancer.choose(request.serviceName(), passable, excluded);
+            if (candidate == null) {
+                return null;
+            }
+            if (candidate.tryAcquireInFlight()) {
+                return candidate;
+            }
+            // 预筛后名额被并发抢走：本轮排除并重选，它的份额让给其它实例
+            excluded.add(candidate.instanceId());
+            capacityFullSkips.computeIfAbsent(candidate.instanceId(),
+                    k -> new AtomicLong()).incrementAndGet();
+            log.info("skip instance={}: CAPACITY_FULL confirmed on acquire "
+                            + "(inFlight={}/max={}), re-selecting among remaining candidates",
+                    candidate.instanceId(), candidate.inFlight(), candidate.maxConcurrency());
+        }
     }
 
     private AttemptResult invokeOnce(ServiceInstance chosen, ForwardRequest request,
@@ -234,6 +361,9 @@ public class GatewayForwarder {
         long now = clock.getAsLong();
         for (ServiceInstance instance : registry.healthyInstances(request.serviceName())) {
             if (triedInstances.contains(instance.instanceId())) {
+                continue;
+            }
+            if (!instance.hasCapacity()) {
                 continue;
             }
             if (breakerFor(instance.instanceId()).allowRequest(now)) {
@@ -280,7 +410,48 @@ public class GatewayForwarder {
         ((DefaultCircuitBreaker) breakerFor(instanceId)).forceOpen(clock.getAsLong());
     }
 
+    /**
+     * 只读运行状态视图：每个实例的熔断状态、是否正在半开探测、最近失败类型分布、
+     * 被熔断/满载跳过的累计次数与当前在途名额占用。
+     *
+     * 只读取快照与计数器，不调用任何会改变状态的方法（如 allowRequest），
+     * 查看视图本身不影响熔断恢复与流量分发。
+     */
+    public List<InstanceStatusView> statusView(String serviceName) {
+        ServiceSnapshot snapshot = registry.snapshot(serviceName);
+        List<String> ids = new ArrayList<>(snapshot.healthyIds());
+        ids.addAll(snapshot.unhealthyIds());
+        List<InstanceStatusView> views = new ArrayList<>();
+        for (String id : ids) {
+            CircuitBreaker breaker = breakers.get(id);
+            ServiceInstance instance = registry.getInstance(serviceName, id);
+            views.add(new InstanceStatusView(
+                    id,
+                    breaker == null ? CircuitState.CLOSED.name() : breaker.state().name(),
+                    breaker != null && breaker.isProbing(),
+                    breaker == null ? Map.of() : breaker.failureTypeDistribution(),
+                    circuitOpenSkips.getOrDefault(id, new AtomicLong()).get(),
+                    capacityFullSkips.getOrDefault(id, new AtomicLong()).get(),
+                    instance == null ? 1 : instance.weight(),
+                    instance == null ? 0 : instance.maxConcurrency(),
+                    instance == null ? 0 : instance.inFlight()));
+        }
+        return views;
+    }
+
     public record CircuitStateView(String instanceId, String state) {
+    }
+
+    /** 单实例只读运行状态。 */
+    public record InstanceStatusView(String instanceId,
+                                     String circuitState,
+                                     boolean probing,
+                                     Map<FailureType, Integer> failureTypeDistribution,
+                                     long circuitOpenSkips,
+                                     long capacityFullSkips,
+                                     int weight,
+                                     int maxConcurrency,
+                                     int inFlight) {
     }
 
     @FunctionalInterface

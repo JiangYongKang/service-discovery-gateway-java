@@ -35,18 +35,35 @@ public class DemoController {
         this.forwarder = forwarder;
     }
 
-    /** 注册 count 个实例，实例ID为 inst-1..inst-count。 */
+    /** 注册 count 个实例，实例ID为 inst-1..inst-count；可带灰度权重与并发上限。 */
     @PostMapping("/register")
-    public Map<String, Object> register(@RequestParam(defaultValue = "3") int count) {
+    public Map<String, Object> register(@RequestParam(defaultValue = "3") int count,
+                                        @RequestParam(defaultValue = "1") int weight,
+                                        @RequestParam(defaultValue = "0") int maxConcurrency) {
         int created = 0;
         for (int i = 1; i <= count; i++) {
             String id = "inst-" + i;
-            if (registry.register(DiscoveryConfig.DEMO_SERVICE, id)) {
+            if (registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxConcurrency)) {
                 created++;
             }
             downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
         }
         return Map.of("requested", count, "newlyRegistered", created,
+                "weight", weight,
+                "maxConcurrency", maxConcurrency <= 0 ? "unlimited" : maxConcurrency,
+                "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
+    }
+
+    /** 单独注册/调整一个实例的权重与并发上限（灰度放量入口）。 */
+    @PostMapping("/instances/{id}/register")
+    public Map<String, Object> registerOne(@PathVariable String id,
+                                           @RequestParam(defaultValue = "1") int weight,
+                                           @RequestParam(defaultValue = "0") int maxConcurrency) {
+        boolean created = registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxConcurrency);
+        downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
+        return Map.of("instance", id, "newlyRegistered", created,
+                "weight", weight,
+                "maxConcurrency", maxConcurrency <= 0 ? "unlimited" : maxConcurrency,
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 
@@ -99,5 +116,14 @@ public class DemoController {
         state.put("circuits", circuits);
         state.put("downstreamInvokeCounts", downstream.snapshotCounts());
         return state;
+    }
+
+    /**
+     * 只读运行状态视图：每个实例的熔断状态、是否正在探测、最近失败类型分布、
+     * 被熔断/满载跳过累计次数与在途名额。查看本身不改变任何状态。
+     */
+    @GetMapping("/status")
+    public Map<String, Object> status() {
+        return Map.of("instances", forwarder.statusView(DiscoveryConfig.DEMO_SERVICE));
     }
 }

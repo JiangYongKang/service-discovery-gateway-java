@@ -15,16 +15,29 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class ServiceInstance {
 
+    /** 不限并发上限的标记值。 */
+    public static final int UNLIMITED_CONCURRENCY = 0;
+
     private final String serviceName;
     private final String instanceId;
+    private final int weight;
+    private final int maxConcurrency;
+    private final AtomicInteger inFlight;
     private volatile InstanceStatus status;
     private final AtomicInteger consecutiveFailures;
     private volatile long evictedAtMillis;
     private volatile long lastProbeResultAtMillis;
 
     public ServiceInstance(String serviceName, String instanceId) {
+        this(serviceName, instanceId, 1, UNLIMITED_CONCURRENCY);
+    }
+
+    public ServiceInstance(String serviceName, String instanceId, int weight, int maxConcurrency) {
         this.serviceName = serviceName;
         this.instanceId = instanceId;
+        this.weight = Math.max(1, weight);
+        this.maxConcurrency = Math.max(UNLIMITED_CONCURRENCY, maxConcurrency);
+        this.inFlight = new AtomicInteger(0);
         this.status = InstanceStatus.HEALTHY;
         this.consecutiveFailures = new AtomicInteger(0);
     }
@@ -51,6 +64,54 @@ public class ServiceInstance {
 
     public long lastProbeResultAtMillis() {
         return lastProbeResultAtMillis;
+    }
+
+    /** 灰度权重：>=1，未指定时为 1（与老行为一致）。 */
+    public int weight() {
+        return weight;
+    }
+
+    /** 并发承载上限：0 表示不限（与老行为一致）。 */
+    public int maxConcurrency() {
+        return maxConcurrency;
+    }
+
+    /** 当前在途请求数。 */
+    public int inFlight() {
+        return inFlight.get();
+    }
+
+    /** 是否还有在途名额（不限上限时恒为 true）。 */
+    public boolean hasCapacity() {
+        return maxConcurrency <= UNLIMITED_CONCURRENCY || inFlight.get() < maxConcurrency;
+    }
+
+    /**
+     * 原子占用一个在途名额；满载时返回 false，调用方本轮应跳过该实例。
+     * CAS 循环保证并发下名额计数准确，绝不超发。
+     */
+    public boolean tryAcquireInFlight() {
+        if (maxConcurrency <= UNLIMITED_CONCURRENCY) {
+            inFlight.incrementAndGet();
+            return true;
+        }
+        while (true) {
+            int current = inFlight.get();
+            if (current >= maxConcurrency) {
+                return false;
+            }
+            if (inFlight.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /**
+     * 归还一个在途名额。无论请求成功、超时还是下游报错都必须调用，
+     * 否则计数泄漏会把实例永久判成满载。
+     */
+    public void releaseInFlight() {
+        inFlight.decrementAndGet();
     }
 
     /** 仅 HEALTHY 实例可参与转发。 */

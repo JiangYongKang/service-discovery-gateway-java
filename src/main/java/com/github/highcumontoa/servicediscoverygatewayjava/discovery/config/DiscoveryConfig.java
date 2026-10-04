@@ -8,9 +8,12 @@ import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.He
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.InMemoryServiceRegistry;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.instance.ServiceRegistry;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.LoadBalancer;
-import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.RoundRobinLoadBalancer;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.loadbalancer.WeightedRoundRobinLoadBalancer;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.HealthConfig;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.RetryBudgetPolicy;
 import com.github.highcumontoa.servicediscoverygatewayjava.discovery.model.RetryPolicy;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.RetryBudget;
+import com.github.highcumontoa.servicediscoverygatewayjava.discovery.retry.SlidingWindowRetryBudget;
 import jakarta.annotation.PreDestroy;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -46,13 +49,28 @@ public class DiscoveryConfig {
     }
 
     @Bean
+    public RetryBudgetPolicy retryBudgetPolicy() {
+        // 默认不启用重试预算：行为与既有版本完全一致。
+        // 需要容量治理时改为例如 new RetryBudgetPolicy(10_000, 20, 0.2)：
+        // 10 秒滑窗内自动重试不超过 20 次且不超过首发量的 20%。
+        return RetryBudgetPolicy.disabled();
+    }
+
+    @Bean
+    public RetryBudget retryBudget(RetryBudgetPolicy retryBudgetPolicy) {
+        return new SlidingWindowRetryBudget(retryBudgetPolicy);
+    }
+
+    @Bean
     public ServiceRegistry serviceRegistry(HealthConfig healthConfig, DownstreamHandler downstream) {
         return new InMemoryServiceRegistry(healthConfig, downstream);
     }
 
     @Bean
     public LoadBalancer loadBalancer() {
-        return new RoundRobinLoadBalancer();
+        // 平滑加权轮询：注册时未指定权重（默认 1）且不限并发时，退化为普通轮询，
+        // 与既有默认行为一致；指定权重后按权重分摊，满载实例本轮自动让出份额。
+        return new WeightedRoundRobinLoadBalancer();
     }
 
     @Bean
@@ -60,9 +78,17 @@ public class DiscoveryConfig {
                                              LoadBalancer loadBalancer,
                                              DownstreamHandler downstream,
                                              RetryPolicy retryPolicy,
-                                             CircuitBreakerConfig circuitConfig) {
+                                             CircuitBreakerConfig circuitConfig,
+                                             RetryBudget retryBudget) {
         return new GatewayForwarder(registry, loadBalancer, downstream, retryPolicy,
-                circuitConfig, System::currentTimeMillis);
+                circuitConfig, System::currentTimeMillis,
+                registry.config().probeTimeoutMillis(), millis -> {
+                    try {
+                        Thread.sleep(millis);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, retryBudget);
     }
 
     @Bean

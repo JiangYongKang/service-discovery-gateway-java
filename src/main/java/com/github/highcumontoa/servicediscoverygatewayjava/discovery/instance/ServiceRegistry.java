@@ -13,6 +13,14 @@ public interface ServiceRegistry {
     /** 注册实例（幂等：已存在（健康或摘除中）时忽略并返回 false）。 */
     boolean register(String serviceName, String instanceId);
 
+    /**
+     * 带灰度权重与并发承载上限的注册。
+     *
+     * @param weight         分发权重（>=1；传 1 与老行为一致）
+     * @param maxConcurrency 在途请求上限（0 表示不限，与老行为一致）
+     */
+    boolean register(String serviceName, String instanceId, int weight, int maxConcurrency);
+
     /** 注销实例：之后永不再参与转发。返回是否真实注销。 */
     boolean deregister(String serviceName, String instanceId);
 
