@@ -21,6 +21,17 @@ public interface ServiceRegistry {
      */
     boolean register(String serviceName, String instanceId, int weight, int maxConcurrency);
 
+    /**
+     * 注册新实例，或对<strong>已存在</strong>实例在线更新权重与并发上限（灰度放量入口）。
+     *
+     * 与 {@link #register} 的区别：实例已存在时不再忽略，而是把 weight/maxConcurrency
+     * 真正更新到运行实例上，下一轮负载均衡即按新值分摊。
+     *
+     * @return REGISTERED 表示新注册，UPDATED 表示更新了已存在实例；结果带归一化后的有效值
+     */
+    RegistrationResult registerOrUpdate(String serviceName, String instanceId,
+                                        int weight, int maxConcurrency);
+
     /** 注销实例：之后永不再参与转发。返回是否真实注销。 */
     boolean deregister(String serviceName, String instanceId);
 
@@ -38,4 +49,21 @@ public interface ServiceRegistry {
 
     /** 健康判定配置。 */
     HealthConfig config();
+
+    /** registerOrUpdate 的结果：REGISTERED 新注册 / UPDATED 在线更新了已存在实例。 */
+    enum RegistrationOutcome {
+        REGISTERED, UPDATED
+    }
+
+    /**
+     * 注册或更新结果。
+     *
+     * @param outcome         新注册还是更新已有实例
+     * @param effectiveWeight 归一化后实际生效的权重（>=1）
+     * @param effectiveMaxConcurrency 归一化后实际生效的并发上限（0=不限）
+     */
+    record RegistrationResult(RegistrationOutcome outcome,
+                              int effectiveWeight,
+                              int effectiveMaxConcurrency) {
+    }
 }

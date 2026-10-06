@@ -38,8 +38,10 @@ public class DiscoveryConfig {
 
     @Bean
     public CircuitBreakerConfig circuitBreakerConfig() {
-        // 连续 3 次真实调用失败熔断；熔断 2 秒后半开；半开探测 1 次成功即恢复
-        return new CircuitBreakerConfig(3, 2000, 1);
+        // 连续 3 次真实调用失败熔断；熔断 2 秒后允许半开探测；半开探测 1 次成功即恢复；
+        // 半开探测 2 秒无结果视为占坑丢失，后台恢复扫描会重新领取（防止实例永久卡在探测中）；
+        // 只读状态视图的失败类型分布统计最近 10 秒。
+        return new CircuitBreakerConfig(3, 2000, 1, 2000, 10_000);
     }
 
     @Bean
@@ -92,9 +94,14 @@ public class DiscoveryConfig {
     }
 
     @Bean
-    public HealthProbeScheduler healthProbeScheduler(ServiceRegistry registry, HealthConfig healthConfig) {
+    public HealthProbeScheduler healthProbeScheduler(ServiceRegistry registry,
+                                                     HealthConfig healthConfig,
+                                                     GatewayForwarder gatewayForwarder) {
         HealthProbeScheduler scheduler = new HealthProbeScheduler(registry);
-        scheduler.start(DEMO_SERVICE, healthConfig.probeIntervalMillis());
+        // 每轮健康探测后，再对所有冷却到点/探测失活的熔断器并行发起恢复探测：
+        // 保证每个到期实例都真正收到一次下游探测，多实例同时到期也互不阻塞。
+        scheduler.start(DEMO_SERVICE, healthConfig.probeIntervalMillis(),
+                () -> gatewayForwarder.sweepRecoveryProbes(DEMO_SERVICE));
         return scheduler;
     }
 

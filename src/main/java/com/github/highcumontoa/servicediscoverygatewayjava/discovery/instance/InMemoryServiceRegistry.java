@@ -72,6 +72,35 @@ public class InMemoryServiceRegistry implements ServiceRegistry {
     }
 
     @Override
+    public RegistrationResult registerOrUpdate(String serviceName, String instanceId,
+                                               int weight, int maxConcurrency) {
+        Map<String, ServiceInstance> instances =
+                services.computeIfAbsent(serviceName, k -> new ConcurrentHashMap<>());
+        ServiceInstance fresh = new ServiceInstance(serviceName, instanceId, weight, maxConcurrency);
+        ServiceInstance existing = instances.putIfAbsent(instanceId, fresh);
+        if (existing == null) {
+            log.info("register-or-update input: service={}, instance={}, weight={}, maxConcurrency={} -> "
+                            + "result=REGISTERED(initial HEALTHY)",
+                    serviceName, instanceId, fresh.weight(),
+                    fresh.maxConcurrency() == ServiceInstance.UNLIMITED_CONCURRENCY
+                            ? "unlimited" : fresh.maxConcurrency());
+            return new RegistrationResult(RegistrationOutcome.REGISTERED,
+                    fresh.weight(), fresh.maxConcurrency());
+        }
+        // 已存在实例：灰度放量/缩量——只更新权重与并发上限，健康状态与失败计数保持不动。
+        // 更新在实例的同步方法内完成，下一轮负载均衡读取到的就是新值。
+        int[] effective = existing.updateLimits(weight, maxConcurrency);
+        log.info("register-or-update input: service={}, instance={}, weight={}, maxConcurrency={} -> "
+                        + "result=UPDATED(existing,status={}), effectiveWeight={}, effectiveMaxConcurrency={}, "
+                        + "next selection round applies new values immediately",
+                serviceName, instanceId, weight,
+                maxConcurrency <= 0 ? "unlimited" : maxConcurrency,
+                existing.status(), effective[0],
+                effective[1] == ServiceInstance.UNLIMITED_CONCURRENCY ? "unlimited" : effective[1]);
+        return new RegistrationResult(RegistrationOutcome.UPDATED, effective[0], effective[1]);
+    }
+
+    @Override
     public boolean deregister(String serviceName, String instanceId) {
         Map<String, ServiceInstance> instances = services.get(serviceName);
         if (instances == null) {

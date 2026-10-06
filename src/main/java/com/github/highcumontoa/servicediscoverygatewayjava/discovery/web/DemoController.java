@@ -54,16 +54,24 @@ public class DemoController {
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 
-    /** 单独注册/调整一个实例的权重与并发上限（灰度放量入口）。 */
+    /**
+     * 单独注册一个实例，或对已存在实例<strong>在线调整</strong>权重与并发上限（灰度放量入口）。
+     * 已存在实例的调整立即对下一轮分流生效（无需重新注册、不影响其健康状态）。
+     */
     @PostMapping("/instances/{id}/register")
     public Map<String, Object> registerOne(@PathVariable String id,
                                            @RequestParam(defaultValue = "1") int weight,
                                            @RequestParam(defaultValue = "0") int maxConcurrency) {
-        boolean created = registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxConcurrency);
+        ServiceRegistry.RegistrationResult result =
+                registry.registerOrUpdate(DiscoveryConfig.DEMO_SERVICE, id, weight, maxConcurrency);
         downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
-        return Map.of("instance", id, "newlyRegistered", created,
-                "weight", weight,
-                "maxConcurrency", maxConcurrency <= 0 ? "unlimited" : maxConcurrency,
+        return Map.of("instance", id,
+                "outcome", result.outcome().name(),
+                "newlyRegistered", result.outcome() == ServiceRegistry.RegistrationOutcome.REGISTERED,
+                // 回显的是归一化后真正生效的值，而不是入参
+                "weight", result.effectiveWeight(),
+                "maxConcurrency", result.effectiveMaxConcurrency() <= 0
+                        ? "unlimited" : result.effectiveMaxConcurrency(),
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 
@@ -88,6 +96,17 @@ public class DemoController {
     public ServiceSnapshot probe() {
         registry.probeOnce(DiscoveryConfig.DEMO_SERVICE);
         return registry.snapshot(DiscoveryConfig.DEMO_SERVICE);
+    }
+
+    /**
+     * 立即触发一轮熔断恢复探测：对每个冷却到点/探测失活的实例各自真实探测一次
+     * （多实例并行、互不阻塞；同一实例探测窗口内只有一个探测）。
+     */
+    @PostMapping("/recovery-probe")
+    public Map<String, Object> recoveryProbe() {
+        int probed = forwarder.sweepRecoveryProbes(DiscoveryConfig.DEMO_SERVICE);
+        return Map.of("dueInstancesProbed", probed,
+                "status", forwarder.statusView(DiscoveryConfig.DEMO_SERVICE));
     }
 
     /** 通过网关转发请求，返回成功/失败、选择序列、失败类型与判定依据。 */

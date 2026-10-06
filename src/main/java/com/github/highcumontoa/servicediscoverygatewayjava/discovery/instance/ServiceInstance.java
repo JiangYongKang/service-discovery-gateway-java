@@ -20,8 +20,13 @@ public class ServiceInstance {
 
     private final String serviceName;
     private final String instanceId;
-    private final int weight;
-    private final int maxConcurrency;
+    /**
+     * 灰度权重与并发上限支持灰度放量过程中在线调整：字段为 volatile，
+     * 调整在 synchronized 方法内完成，负载均衡/容量预筛的读线程立即看到新值，
+     * 下一轮选择即按新权重/新上限分摊，无需重新注册实例。
+     */
+    private volatile int weight;
+    private volatile int maxConcurrency;
     private final AtomicInteger inFlight;
     private volatile InstanceStatus status;
     private final AtomicInteger consecutiveFailures;
@@ -74,6 +79,22 @@ public class ServiceInstance {
     /** 并发承载上限：0 表示不限（与老行为一致）。 */
     public int maxConcurrency() {
         return maxConcurrency;
+    }
+
+    /**
+     * 在线调整灰度权重与并发上限（放量/缩量入口）。
+     *
+     * - 只改这两个运行参数，不动健康状态、失败计数与在途占用；
+     * - 调整对下一轮负载均衡立即生效：平滑加权轮询直接读取最新 weight，
+     *   容量预筛直接读取最新 maxConcurrency（正在途请求不受影响，结束后照常归还）；
+     * - 入参非法（weight &lt; 1、maxConcurrency &lt; 0）时取与注册相同的兜底值。
+     *
+     * @return 归一化后的有效值
+     */
+    public synchronized int[] updateLimits(int newWeight, int newMaxConcurrency) {
+        this.weight = Math.max(1, newWeight);
+        this.maxConcurrency = Math.max(UNLIMITED_CONCURRENCY, newMaxConcurrency);
+        return new int[]{this.weight, this.maxConcurrency};
     }
 
     /** 当前在途请求数。 */
