@@ -259,4 +259,171 @@ class CircuitRecoveryChainTest {
         assertEquals("CLOSED", viewOf(h, "i1").circuitState());
         assertFalse(viewOf(h, "i1").probing());
     }
+
+    @Test
+    void multipleInstancesCoolingDownTogetherEachGetExactlyOneProbeAndRecoverIndependently() {
+        var sim = new SimulatedDownstream(0);
+        var h = harness(sim, sim);
+        // 下游整体抖动：三个实例同时故障
+        h.registry.register(SVC, "i1", 1, 0);
+        h.registry.register(SVC, "i2", 1, 0);
+        h.registry.register(SVC, "i3", 1, 0);
+        for (String id : List.of("i1", "i2", "i3")) {
+            sim.setMode(id, SimulatedDownstream.Mode.REFUSE);
+        }
+
+        // 阶段 1：流量把三个实例的熔断器全部打开
+        boolean allOpen = false;
+        for (int i = 0; i < 40 && !allOpen; i++) {
+            h.forwarder.forward(new ForwardRequest(SVC, "open-" + i, "p", false));
+            allOpen = viewOf(h, "i1").circuitState().equals("OPEN")
+                    && viewOf(h, "i2").circuitState().equals("OPEN")
+                    && viewOf(h, "i3").circuitState().equals("OPEN");
+        }
+        assertTrue(allOpen, "三个实例应全部熔断");
+        log.info("input: all 3 instances REFUSE; result: all circuits OPEN; "
+                + "basis=downstream-wide outage opens every instance circuit");
+
+        // 阶段 2：冷却同时到期 + 下游整体恢复 -> 每个实例都必须恰好收到一次真实探测
+        h.clock.addAndGet(2000);
+        for (String id : List.of("i1", "i2", "i3")) {
+            sim.setMode(id, SimulatedDownstream.Mode.NORMAL);
+        }
+        Map<String, Integer> callsBefore = Map.of(
+                "i1", sim.invokeCount("i1"), "i2", sim.invokeCount("i2"), "i3", sim.invokeCount("i3"));
+        for (int r = 0; r < 3; r++) {
+            ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, "recover-" + r, "p", false));
+            assertTrue(o.success(), "恢复期每个请求都应成功");
+        }
+        Map<String, Integer> probeCalls = new java.util.HashMap<>();
+        for (String id : List.of("i1", "i2", "i3")) {
+            probeCalls.put(id, sim.invokeCount(id) - callsBefore.get(id));
+        }
+        var states = List.of(viewOf(h, "i1").circuitState(), viewOf(h, "i2").circuitState(),
+                viewOf(h, "i3").circuitState());
+        log.info("input: 3 instances cooldown elapsed together, downstream recovered, 3 requests; "
+                        + "result: probeCallsPerInstance={}, states={}; "
+                        + "basis=each instance gets exactly ONE real probe and recovers independently",
+                probeCalls, states);
+        assertEquals(Map.of("i1", 1, "i2", 1, "i3", 1), probeCalls,
+                "每个冷却到点的实例都必须恰好收到一次真实探测，不得有实例卡在半开等不到探测");
+        assertEquals(List.of("CLOSED", "CLOSED", "CLOSED"), states,
+                "探测成功后各实例各自恢复接流量，互不影响");
+        assertFalse(viewOf(h, "i1").probing() || viewOf(h, "i2").probing()
+                || viewOf(h, "i3").probing(), "恢复后不得有实例停在探测中状态");
+
+        // 阶段 3：全部恢复后流量重新分摊到三个实例
+        var served = new java.util.HashMap<String, Integer>();
+        for (int i = 0; i < 30; i++) {
+            ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, "post-" + i, "p", false));
+            served.merge(o.attempts().get(0).instanceId(), 1, Integer::sum);
+        }
+        log.info("input: 30 requests after full recovery; result: served={}; "
+                + "basis=all recovered instances rejoin traffic", served);
+        assertEquals(3, served.size(), "恢复后三个实例都应重新承接流量");
+    }
+
+    @Test
+    void lowWeightInstanceStillGetsRealProbeWhenCooldownElapses() {
+        var sim = new SimulatedDownstream(0);
+        var h = harness(sim, sim);
+        // i1 权重 100 健康兜底；i2 权重仅 1 且被熔断
+        h.registry.register(SVC, "i1", 100, 0);
+        h.registry.register(SVC, "i2", 1, 0);
+        h.forwarder.forceOpen(SVC, "i2");
+        assertEquals("OPEN", viewOf(h, "i2").circuitState());
+
+        // 冷却到点：即使 i2 权重极低，下一个请求也必须真实探测 i2 而不是按权重走 i1
+        h.clock.addAndGet(2000);
+        int i2CallsBefore = sim.invokeCount("i2");
+        ForwardOutcome probe = h.forwarder.forward(new ForwardRequest(SVC, null, "p", false));
+        var view = viewOf(h, "i2");
+        log.info("input: i2 weight=1 vs i1 weight=100, i2 cooldown elapsed; result: chosen={}, "
+                        + "i2ProbeCalls={}, state={}; basis=probe priority ignores weight",
+                probe.attempts().get(0).instanceId(), sim.invokeCount("i2") - i2CallsBefore,
+                view.circuitState());
+        assertTrue(probe.success());
+        assertEquals("i2", probe.attempts().get(0).instanceId(),
+                "低权重实例冷却到点也必须被真实探测，不得被高权重实例挤掉");
+        assertEquals(1, sim.invokeCount("i2") - i2CallsBefore, "探测是对 i2 的一次真实下游调用");
+        assertEquals("CLOSED", view.circuitState(), "探测成功立即恢复");
+    }
+
+    @Test
+    void failedProbeRestartsCooldownAndNoProbeDuringNewCooldown() {
+        var sim = new SimulatedDownstream(0);
+        var h = harness(sim, sim);
+        h.registry.register(SVC, "i1", 1, 0);
+        h.registry.register(SVC, "i2", 1, 0);
+        sim.setMode("i1", SimulatedDownstream.Mode.REFUSE);
+        for (int i = 0; i < 8 && !viewOf(h, "i1").circuitState().equals("OPEN"); i++) {
+            h.forwarder.forward(new ForwardRequest(SVC, "open-" + i, "p", false));
+        }
+        assertEquals("OPEN", viewOf(h, "i1").circuitState());
+
+        // 冷却到期但故障依旧：探测真实发出并失败 -> 重新计时
+        h.clock.addAndGet(2000);
+        ForwardOutcome failedProbe = h.forwarder.forward(new ForwardRequest(SVC, null, "p", false));
+        assertEquals("i1", failedProbe.attempts().get(0).instanceId(), "冷却到点必须真实探测 i1");
+        assertEquals("OPEN", viewOf(h, "i1").circuitState(), "探测失败保持熔断并重新计时");
+
+        // 新冷却期内：再多请求也不得对 i1 发起任何新的下游调用
+        int i1CallsAfterFailedProbe = sim.invokeCount("i1");
+        h.clock.addAndGet(1999); // 新冷却 2000ms 未满
+        for (int i = 0; i < 5; i++) {
+            ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, "during-" + i, "p", false));
+            assertTrue(o.success());
+            assertEquals("i2", o.attempts().get(0).instanceId(), "新冷却期内请求必须绕开 i1");
+        }
+        int i1Delta = sim.invokeCount("i1") - i1CallsAfterFailedProbe;
+        log.info("input: 5 requests within restarted cooldown (1999ms<2000ms); result: i1NewCalls={}, "
+                        + "state={}; basis=failed probe restarts timer, no probe during new cooldown",
+                i1Delta, viewOf(h, "i1").circuitState());
+        assertEquals(0, i1Delta, "探测失败重新计时后，新冷却期内不得再探测 i1");
+
+        // 新冷却到期且下游恢复：i1 再次被真实探测并恢复
+        h.clock.addAndGet(1);
+        sim.setMode("i1", SimulatedDownstream.Mode.NORMAL);
+        ForwardOutcome recovered = h.forwarder.forward(new ForwardRequest(SVC, null, "p", false));
+        log.info("input: new cooldown elapsed, i1 NORMAL; result: chosen={}, state={}; "
+                        + "basis=next probe after restarted cooldown recovers",
+                recovered.attempts().get(0).instanceId(), viewOf(h, "i1").circuitState());
+        assertEquals("i1", recovered.attempts().get(0).instanceId());
+        assertEquals("CLOSED", viewOf(h, "i1").circuitState());
+    }
+
+    @Test
+    void failureTypeDistributionReflectsOnlyRecentWindow() {
+        var sim = new SimulatedDownstream(0);
+        var h = harness(sim, sim);
+        h.registry.register(SVC, "i1", 1, 0);
+        h.registry.register(SVC, "i2", 1, 0);
+        sim.setMode("i1", SimulatedDownstream.Mode.REFUSE);
+        for (int i = 0; i < 8 && !viewOf(h, "i1").circuitState().equals("OPEN"); i++) {
+            h.forwarder.forward(new ForwardRequest(SVC, "open-" + i, "p", false));
+        }
+        var openView = viewOf(h, "i1");
+        assertEquals(3, openView.failureTypeDistribution().get(FailureType.CONNECTION_REFUSED),
+                "窗口内应看到最近的 3 次拒绝失败");
+
+        // 时钟越过统计窗口（默认 60s）：旧失败不再计入分布，且查看视图不改变任何状态
+        h.clock.addAndGet(61_000);
+        var staleView = viewOf(h, "i1");
+        log.info("input: clock advanced 61s beyond failure window; result: failureDist={}, state={}; "
+                        + "basis=distribution reflects recent window only, view stays read-only",
+                staleView.failureTypeDistribution(), staleView.circuitState());
+        assertTrue(staleView.failureTypeDistribution().isEmpty(),
+                "窗口外的历史失败不得再计入分布（不是只增累计）");
+        assertEquals("OPEN", staleView.circuitState(), "查看视图不得改变熔断状态");
+        assertFalse(staleView.probing());
+
+        // 窗口内出现新失败：分布只包含新失败，旧数据不复活
+        ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, null, "p", false));
+        assertEquals("i1", o.attempts().get(0).instanceId(), "冷却早已到期，本次为真实探测");
+        var freshView = viewOf(h, "i1");
+        log.info("input: new probe failure inside window; result: failureDist={}; "
+                + "basis=only in-window failures are counted", freshView.failureTypeDistribution());
+        assertEquals(1, freshView.failureTypeDistribution().get(FailureType.CONNECTION_REFUSED),
+                "分布只统计最近窗口内的失败");
+    }
 }

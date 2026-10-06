@@ -21,6 +21,24 @@ public interface CircuitBreaker {
     /** 是否允许当前请求通过（OPEN 时返回 false；到期时原子地放行唯一探测）。 */
     boolean allowRequest(long now);
 
+    /**
+     * 冷却是否已到期、可以发起一次半开探测（只读，不改变状态）。
+     * 仅 OPEN 且距打开超过 openMillis 时返回 true。
+     */
+    default boolean probeDue(long now) {
+        return false;
+    }
+
+    /**
+     * 原子地获取本实例的唯一探测权：仅当冷却到期（OPEN 且到时）时
+     * 把状态翻为 HALF_OPEN 并返回 true；同一探测窗口内并发调用只有一个
+     * 胜出，其余返回 false。调用方拿到 true 后必须真实发出一次下游探测，
+     * 并以 recordSuccess/recordFailure 收尾。
+     */
+    default boolean tryAcquireProbe(long now) {
+        return false;
+    }
+
     /** 记录一次成功（HALF_OPEN 中可能触发恢复）。 */
     void recordSuccess(long now);
 
@@ -37,8 +55,8 @@ public interface CircuitBreaker {
         return state() == CircuitState.HALF_OPEN;
     }
 
-    /** 最近失败类型分布（只读快照，不改变状态）。 */
-    default Map<FailureType, Integer> failureTypeDistribution() {
+    /** 最近 failureWindowMillis 内的失败类型分布（只读快照，不改变状态）。 */
+    default Map<FailureType, Integer> failureTypeDistribution(long now) {
         return Map.of();
     }
 }

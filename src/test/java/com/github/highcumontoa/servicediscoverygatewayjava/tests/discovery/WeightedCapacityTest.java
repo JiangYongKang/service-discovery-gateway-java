@@ -184,4 +184,49 @@ class WeightedCapacityTest {
         assertTrue(o.success());
         assertEquals(0, i1.inFlight());
     }
+
+    @Test
+    void updatingExistingInstanceWeightAndConcurrencyTakesEffect() {
+        var h = harness(new SimulatedDownstream(0));
+        h.registry.register(SVC, "heavy", 1, 0);
+        h.registry.register(SVC, "light", 1, 0);
+
+        // 基线：权重 1:1，20 个请求严格均摊
+        int heavyBefore = 0;
+        for (int i = 0; i < 20; i++) {
+            ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, "pre-" + i, "p", false));
+            if (o.attempts().get(0).instanceId().equals("heavy")) {
+                heavyBefore++;
+            }
+        }
+        log.info("input: weights 1:1, 20 requests; result: heavy={}; basis=equal split", heavyBefore);
+        assertEquals(10, heavyBefore, "权重 1:1 下应均摊");
+
+        // 灰度放量：对已存在实例调大权重的并发上限——注册返回 false（非新建）但必须真正生效
+        boolean created = h.registry.register(SVC, "heavy", 3, 5);
+        var heavy = h.registry.getInstance(SVC, "heavy");
+        log.info("input: re-register existing heavy with weight=3 maxConcurrency=5; result: "
+                        + "newlyRegistered={}, effectiveWeight={}, effectiveMaxConcurrency={}; "
+                        + "basis=reconfigure in place, not echo-only",
+                created, heavy.weight(), heavy.maxConcurrency());
+        assertEquals(false, created, "已存在实例不是新建注册");
+        assertEquals(3, heavy.weight(), "已存在实例的权重调整必须真正生效");
+        assertEquals(5, heavy.maxConcurrency(), "已存在实例的并发上限调整必须真正生效");
+
+        // 调整后：40 个请求必须按新权重 3:1 分摊
+        int heavyAfter = 0;
+        int lightAfter = 0;
+        for (int i = 0; i < 40; i++) {
+            ForwardOutcome o = h.forwarder.forward(new ForwardRequest(SVC, "post-" + i, "p", false));
+            if (o.attempts().get(0).instanceId().equals("heavy")) {
+                heavyAfter++;
+            } else {
+                lightAfter++;
+            }
+        }
+        log.info("input: 40 requests after weight update to 3:1; result: heavy={}, light={}; "
+                + "basis=traffic split follows the NEW weights", heavyAfter, lightAfter);
+        assertEquals(30, heavyAfter, "权重调整为 3:1 后 heavy 应占 3/4，实际=" + heavyAfter);
+        assertEquals(10, lightAfter, "权重调整为 3:1 后 light 应占 1/4，实际=" + lightAfter);
+    }
 }

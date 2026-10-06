@@ -103,4 +103,62 @@ class CircuitBreakerTest {
                 + "basis=consecutive counter reset by success", cb.state());
         assertEquals(CircuitState.CLOSED, cb.state(), "未连续达到阈值不应熔断");
     }
+
+    @Test
+    void probeDueIsReadOnlyAndTryAcquireProbeGrantsSingleWinner() {
+        var cb = new DefaultCircuitBreaker("i1", config);
+        for (int i = 0; i < 3; i++) {
+            cb.recordFailure(clock.get());
+        }
+        clock.addAndGet(2000);
+
+        // probeDue 只读：反复调用不翻牌
+        assertTrue(cb.probeDue(clock.get()));
+        assertTrue(cb.probeDue(clock.get()));
+        assertEquals(CircuitState.OPEN, cb.state(), "probeDue 不得改变状态");
+
+        // tryAcquireProbe 原子：同一探测窗口只有一个胜出者
+        boolean first = cb.tryAcquireProbe(clock.get());
+        boolean second = cb.tryAcquireProbe(clock.get());
+        log.info("input: cooldown elapsed, two tryAcquireProbe calls; result: first={}, second={}, "
+                + "state={}; basis=exactly one probe per window", first, second, cb.state());
+        assertTrue(first);
+        assertFalse(second, "同一探测窗口内只能有一个探测胜出");
+        assertEquals(CircuitState.HALF_OPEN, cb.state());
+
+        // 探测失败 -> 重新 OPEN 并重计时：新冷却期内 probeDue=false、tryAcquireProbe 失败
+        cb.recordFailure(clock.get());
+        assertEquals(CircuitState.OPEN, cb.state());
+        assertFalse(cb.probeDue(clock.get()), "重新计时后新冷却期内不得再到点");
+        assertFalse(cb.tryAcquireProbe(clock.get()));
+        clock.addAndGet(2000);
+        assertTrue(cb.probeDue(clock.get()), "新冷却期满后再次到点");
+        assertTrue(cb.tryAcquireProbe(clock.get()));
+    }
+
+    @Test
+    void failureTypeDistributionCoversOnlyRecentWindow() {
+        var windowed = new CircuitBreakerConfig(3, 2000, 1, 5000);
+        var cb = new DefaultCircuitBreaker("i1", windowed);
+        cb.recordFailure(clock.get(), com.github.highcumontoa.servicediscoverygatewayjava
+                .discovery.model.FailureType.TIMEOUT);
+        cb.recordFailure(clock.get(), com.github.highcumontoa.servicediscoverygatewayjava
+                .discovery.model.FailureType.CONNECTION_REFUSED);
+
+        var inWindow = cb.failureTypeDistribution(clock.get());
+        log.info("input: 2 typed failures at t=1000, window=5000ms; result: dist={}; "
+                + "basis=in-window failures counted", inWindow);
+        assertEquals(1, inWindow.get(com.github.highcumontoa.servicediscoverygatewayjava
+                .discovery.model.FailureType.TIMEOUT));
+        assertEquals(1, inWindow.get(com.github.highcumontoa.servicediscoverygatewayjava
+                .discovery.model.FailureType.CONNECTION_REFUSED));
+
+        // 越过窗口：旧失败不再计入；读取本身不改变状态
+        clock.addAndGet(5001);
+        var outOfWindow = cb.failureTypeDistribution(clock.get());
+        log.info("input: clock advanced beyond window; result: dist={}, state={}; "
+                + "basis=recent-window semantics, read-only view", outOfWindow, cb.state());
+        assertTrue(outOfWindow.isEmpty(), "窗口外的历史失败不得计入分布（不是只增累计）");
+        assertEquals(CircuitState.CLOSED, cb.state(), "查看分布不得改变熔断状态");
+    }
 }

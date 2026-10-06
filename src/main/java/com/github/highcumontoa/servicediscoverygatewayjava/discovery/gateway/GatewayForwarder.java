@@ -42,9 +42,11 @@ import java.util.function.LongSupplier;
  * 3. 容量预筛：在途请求已达 maxConcurrency 的实例本轮跳过（CAPACITY_FULL），
  *    其权重份额按比例让给其余有余量实例；名额归还后自动回到分发；
  * 4. 实例级熔断器 OPEN 时直接跳过（CIRCUIT_OPEN），不向下游放大流量；
- *    冷却到期的翻牌（OPEN->HALF_OPEN）只发生在有余量的实例上，且翻牌实例本轮
- *    优先被选中——保证冷却到点后它一定真实收到一次下游探测请求；
+ *    冷却到点的实例先被记为探测候选（只读判断，不翻牌），选中时才发现子翻牌
+ *    （OPEN->HALF_OPEN）并真实发出唯一探测——翻牌与真实探测严格一一对应，
+ *    多个实例同时到点时各自独立探测、互不阻塞，不会卡在半开状态；
  * 5. 负载均衡在“健康且有余量且熔断放行且本次未试过”的候选中按权重分摊；
+ *    探测候选无视权重优先（低权重实例冷却到点也必然被真实探测）；
  *    选中后以 CAS 原子占用在途名额，请求结束（成功/超时/下游报错）必归还；
  * 6. 执行并区分失败类型：TIMEOUT / CONNECTION_REFUSED / DOWNSTREAM_ERROR；
  * 7. 仅可安全重试、且失败属传输类、且未超 maxAttempts、且还有别的健康实例、
@@ -179,17 +181,19 @@ public class GatewayForwarder {
                 }
             }
 
-            // 在有余量的快照上剔除熔断未放行的实例；冷却到期的翻牌实例记为探测候选
+            // 在有余量的快照上分流：CLOSED 直接放行；冷却到点的 OPEN 实例只记为
+            // 探测候选（此处绝不翻牌），其余（OPEN 未到期 / HALF_OPEN 探测中）跳过。
+            // 翻牌被推迟到 selectInstance 真正选中该实例时原子发生——这样多个实例
+            // 同时冷却到点时，每个实例只会在“确定要向它发探测”的那一刻翻牌，
+            // 不会出现翻了牌却没发探测、永远卡在 HALF_OPEN 的实例。
             List<ServiceInstance> passable = new ArrayList<>();
-            ServiceInstance probeCandidate = null;
+            List<ServiceInstance> probeCandidates = new ArrayList<>();
             for (ServiceInstance instance : withCapacity) {
                 CircuitBreaker breaker = breakerFor(instance.instanceId());
-                if (breaker.allowRequest(now)) {
+                if (breaker.state() == CircuitState.CLOSED) {
                     passable.add(instance);
-                    if (breaker.state() == CircuitState.HALF_OPEN) {
-                        // 本次调用触发了 OPEN->HALF_OPEN 翻牌：它必须真的收到探测请求
-                        probeCandidate = instance;
-                    }
+                } else if (breaker.probeDue(now)) {
+                    probeCandidates.add(instance);
                 } else {
                     circuitOpenSkips.computeIfAbsent(instance.instanceId(),
                             k -> new AtomicLong()).incrementAndGet();
@@ -198,7 +202,7 @@ public class GatewayForwarder {
                 }
             }
 
-            ServiceInstance chosen = selectInstance(request, passable, probeCandidate, triedInstances);
+            ServiceInstance chosen = selectInstance(request, passable, probeCandidates, triedInstances, now);
             if (chosen == null) {
                 FailureType type;
                 if (healthy.isEmpty()) {
@@ -213,6 +217,7 @@ public class GatewayForwarder {
                 String reason = "no candidate on attempt " + attempt + "/" + maxAttempts
                         + " (healthy=" + healthy.size() + ", withCapacity=" + withCapacity.size()
                         + ", passableCircuits=" + passable.size()
+                        + ", probeCandidates=" + probeCandidates.size()
                         + ", triedThisRequest=" + triedInstances + ")";
                 return fail(type, reason, attempts);
             }
@@ -295,27 +300,44 @@ public class GatewayForwarder {
 
     /**
      * 选择本轮实例并以 CAS 原子占用在途名额：
-     * - 熔断翻牌的探测候选优先（冷却到点后必须真的发出探测）；
+     * - 冷却到点的探测候选优先（无视权重，低权重实例也必然被真实探测）：
+     *   先占在途名额，再 tryAcquireProbe 原子翻牌——只有真正拿到探测权的
+     *   请求才把实例翻成 HALF_OPEN 并向它发出唯一探测；翻牌被并发请求抢走
+     *   时归还名额并看下一个候选，同一实例的探测窗口内永远只有一个探测；
+     * - 多个实例同时冷却到点时按候选顺序逐个探测：每个请求只探测一个实例，
+     *   后续请求继续探测其余到点实例，各实例独立恢复、互不阻塞；
      * - 其余走负载均衡按权重分摊；
      * - 选中后 tryAcquireInFlight 失败（名额被并发抢走）则本轮排除该实例重选，
      *   名额计数绝不超发。
      */
     private ServiceInstance selectInstance(ForwardRequest request, List<ServiceInstance> passable,
-                                           ServiceInstance probeCandidate, Set<String> triedInstances) {
+                                           List<ServiceInstance> probeCandidates,
+                                           Set<String> triedInstances, long now) {
         Set<String> excluded = new HashSet<>(triedInstances);
-        if (probeCandidate != null && !triedInstances.contains(probeCandidate.instanceId())) {
-            if (probeCandidate.tryAcquireInFlight()) {
-                log.info("probe priority: instance={} just flipped OPEN->HALF_OPEN, "
-                                + "selected as the single trial request (inFlight={}/{})",
+        for (ServiceInstance probeCandidate : probeCandidates) {
+            if (triedInstances.contains(probeCandidate.instanceId())) {
+                continue;
+            }
+            if (!probeCandidate.tryAcquireInFlight()) {
+                capacityFullSkips.computeIfAbsent(probeCandidate.instanceId(),
+                        k -> new AtomicLong()).incrementAndGet();
+                log.info("skip instance={}: CAPACITY_FULL on probe acquire (raced), try next candidate",
+                        probeCandidate.instanceId());
+                continue;
+            }
+            CircuitBreaker breaker = breakerFor(probeCandidate.instanceId());
+            if (breaker.tryAcquireProbe(now)) {
+                log.info("probe priority: instance={} cooldown elapsed, probe acquired atomically, "
+                                + "selected as the single trial request (inFlight={}/{}), weight={} ignored for probes",
                         probeCandidate.instanceId(), probeCandidate.inFlight(),
-                        probeCandidate.maxConcurrency() <= 0 ? "unlimited" : probeCandidate.maxConcurrency());
+                        probeCandidate.maxConcurrency() <= 0 ? "unlimited" : probeCandidate.maxConcurrency(),
+                        probeCandidate.weight());
                 return probeCandidate;
             }
-            excluded.add(probeCandidate.instanceId());
-            capacityFullSkips.computeIfAbsent(probeCandidate.instanceId(),
-                    k -> new AtomicLong()).incrementAndGet();
-            log.info("skip instance={}: CAPACITY_FULL on probe acquire (raced), retry selection",
-                    probeCandidate.instanceId());
+            // 探测权被并发请求拿走（它已成为该实例的唯一探测）：归还名额，本请求走正常分发
+            probeCandidate.releaseInFlight();
+            log.info("probe race lost: instance={} already being probed by a concurrent request, "
+                    + "falling back to normal selection", probeCandidate.instanceId());
         }
         while (true) {
             ServiceInstance candidate =
@@ -366,7 +388,10 @@ public class GatewayForwarder {
             if (!instance.hasCapacity()) {
                 continue;
             }
-            if (breakerFor(instance.instanceId()).allowRequest(now)) {
+            // 只读判断：CLOSED 或冷却到点即视为可用；此处绝不翻牌，
+            // 翻牌只发生在 selectInstance 真正选中探测时
+            CircuitBreaker breaker = breakerFor(instance.instanceId());
+            if (breaker.state() == CircuitState.CLOSED || breaker.probeDue(now)) {
                 return true;
             }
         }
@@ -419,6 +444,7 @@ public class GatewayForwarder {
      */
     public List<InstanceStatusView> statusView(String serviceName) {
         ServiceSnapshot snapshot = registry.snapshot(serviceName);
+        long now = clock.getAsLong();
         List<String> ids = new ArrayList<>(snapshot.healthyIds());
         ids.addAll(snapshot.unhealthyIds());
         List<InstanceStatusView> views = new ArrayList<>();
@@ -429,7 +455,7 @@ public class GatewayForwarder {
                     id,
                     breaker == null ? CircuitState.CLOSED.name() : breaker.state().name(),
                     breaker != null && breaker.isProbing(),
-                    breaker == null ? Map.of() : breaker.failureTypeDistribution(),
+                    breaker == null ? Map.of() : breaker.failureTypeDistribution(now),
                     circuitOpenSkips.getOrDefault(id, new AtomicLong()).get(),
                     capacityFullSkips.getOrDefault(id, new AtomicLong()).get(),
                     instance == null ? 1 : instance.weight(),

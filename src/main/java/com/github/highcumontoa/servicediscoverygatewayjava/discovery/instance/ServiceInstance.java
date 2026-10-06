@@ -20,8 +20,9 @@ public class ServiceInstance {
 
     private final String serviceName;
     private final String instanceId;
-    private final int weight;
-    private final int maxConcurrency;
+    // 灰度权重与并发上限允许运行期调整（灰度放量入口），volatile 保证读线程立即可见
+    private volatile int weight;
+    private volatile int maxConcurrency;
     private final AtomicInteger inFlight;
     private volatile InstanceStatus status;
     private final AtomicInteger consecutiveFailures;
@@ -74,6 +75,16 @@ public class ServiceInstance {
     /** 并发承载上限：0 表示不限（与老行为一致）。 */
     public int maxConcurrency() {
         return maxConcurrency;
+    }
+
+    /**
+     * 运行期调整灰度权重与并发上限（实例已存在时的再注册语义）。
+     * 同步方法内完成成对更新，负载均衡与容量预筛下一轮即读到新值，
+     * 流量分摊按新权重、名额上限按新值执行。
+     */
+    public synchronized void updateCapacity(int weight, int maxConcurrency) {
+        this.weight = Math.max(1, weight);
+        this.maxConcurrency = Math.max(UNLIMITED_CONCURRENCY, maxConcurrency);
     }
 
     /** 当前在途请求数。 */

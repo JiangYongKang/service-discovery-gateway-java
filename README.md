@@ -42,6 +42,10 @@ discovery/
   **并发注册同一实例只有一个胜出**，健康集合不会重复计入同一实例。
 - `register(service, instanceId, weight, maxConcurrency)` 可携带灰度权重与并发承载
   上限（见 3.1）；缺省 `weight=1`、`maxConcurrency=0`（不限），与老行为完全一致。
+  **实例已存在时，本次调用视为灰度放量调整**：在原实例上原子更新权重与并发上限
+  （返回值 `false` 表示不是新建），负载均衡与容量预筛从下一轮选择起即按新值分摊，
+  不需要注销重注册；HTTP 回显中的 `weight`/`maxConcurrency` 是生效后的真实值，
+  并带 `updatedExisting=true` 标记。
 - `deregister(service, instanceId)` 把实例标记为 `DEREGISTERED` 终态并从注册表移除；
   等待探测锁的注销请求在拿到锁后会二次确认，**注销实例永不复活、永不参与转发**。
 
@@ -81,7 +85,8 @@ discovery/
   `RANDOM`。
 - **权重分摊**：注册时可声明 `weight`（>=1，默认 1）。平滑加权轮询（与 nginx 同算法）
   让长期选中比例精确等于权重比，且分布平滑不扎堆；全部实例权重为 1 时退化为普通
-  轮询，与既有默认行为一致。
+  轮询，与既有默认行为一致。**已存在实例可再次调用注册接口调大/调小权重与并发
+  上限**，新值在原实例上立即生效，下一轮选择起流量即按新比例分摊（见 2.1）。
 - **容量治理**：注册时可声明 `maxConcurrency`（在途请求上限，0=不限，默认不限）。
   - 每轮选择前做容量预筛：在途数已达上限的实例本轮跳过（日志 `CAPACITY_FULL`），
     它的权重份额按比例让给其余**还有余量**的健康实例；
@@ -161,12 +166,17 @@ discovery/
 ```
 
 - **OPEN**：一切请求快速失败（`CIRCUIT_OPEN`），**零下游调用**，不放大故障流量；
-- **恢复触发条件**：冷却 `openMillis` 到期后，下一个经过容量预筛（有余量）的真实
-  请求触发 `allowRequest` 原子翻牌到 `HALF_OPEN`，**同一时刻只放行一个探测请求**，
-  其余请求仍快速失败；
+- **恢复触发条件**：冷却 `openMillis` 到期后，实例先被记为**探测候选**（只读判断，
+  不翻牌）；当某次真实转发选中它时，才通过 `tryAcquireProbe` **原子翻牌**到
+  `HALF_OPEN` 并向它发出唯一探测请求——**翻牌与真实探测严格一一对应**；
+  - 同一实例的探测窗口内**只有一个探测**：并发请求同时抢探测权时只有一个胜出，
+    其余请求走正常分发，绝不一拥而上；
+  - **多实例同时冷却到点时各自独立恢复、互不阻塞**：每个请求只探测一个到点实例，
+    后续请求继续探测其余到点实例，直到每个实例都真实收到一次探测——不会出现
+    “翻了牌却没发探测、永远卡在 HALF_OPEN”的实例；
+  - 探测候选**无视权重优先**：低权重实例冷却到点也必然被真实探测，不会被高权重
+    实例挤掉；
   - 翻牌只发生在**有余量**的实例上——满载实例不会被翻牌，等它空下来再进入探测；
-  - 翻牌实例本轮**优先被选中**，保证冷却到点后它**一定真实收到一次下游探测请求**
-    （而不是只翻状态不发流量）；
   - 只读视图（见 4.1）与权重/容量筛选都**不会**触发翻牌，只有真实转发请求才会；
 - 半开探测成功次数达到 `trialSuccessRequired` → 回 `CLOSED`，流量恢复；
 - 半开探测**任一失败 → 立即回 `OPEN` 并重新计时**，必须再等一个冷却周期才会有
@@ -182,19 +192,19 @@ discovery/
 |------|------|
 | `circuitState` | 当前熔断状态（CLOSED / OPEN / HALF_OPEN） |
 | `probing` | 是否正处于半开探测窗口（探测请求在途） |
-| `failureTypeDistribution` | 最近失败类型分布（按 FailureType 累计） |
+| `failureTypeDistribution` | **最近 `failureWindowMillis`（默认 60s）内**的失败类型分布，滑出窗口的历史失败不再计入（不是自启动以来的只增累计） |
 | `circuitOpenSkips` | 因熔断打开被跳过的累计次数 |
 | `capacityFullSkips` | 因满载被跳过的累计次数 |
 | `weight` / `maxConcurrency` / `inFlight` | 权重、并发上限与当前在途数 |
 
-视图只读取快照与计数器，**不调用任何会改变状态的方法**（如 `allowRequest`），
-查看本身不影响熔断恢复、探测节奏与流量分发。
+视图只读取快照与计数器，**不调用任何会改变状态的方法**（如 `allowRequest` /
+`tryAcquireProbe`），查看本身不影响熔断恢复、探测节奏与流量分布统计。
 
 ---
 
 ## 5. 本地验证方法
 
-### 5.1 运行单元测试（36 个，覆盖需求全部关键场景）
+### 5.1 运行单元测试（43 个，覆盖需求全部关键场景）
 
 ```bash
 mvn test
@@ -204,13 +214,13 @@ mvn test
 |--------|----------|
 | `RegistryConcurrencyTest` | 并发重复注册只生效一次、连续失败摘除、冷却后恢复、注册/注销/探测并发交替的健康集合不变量 |
 | `LoadBalancerTest` | 轮询顺序、重试排除已试实例、健康集合缩小时平滑收敛、随机候选过滤 |
-| `CircuitBreakerTest` | CLOSED→OPEN 阈值、OPEN 快速失败、半开唯一探测、探测成功恢复、探测失败保持熔断并重新计时 |
+| `CircuitBreakerTest` | CLOSED→OPEN 阈值、OPEN 快速失败、半开唯一探测、探测成功恢复、探测失败保持熔断并重新计时；`probeDue` 只读、`tryAcquireProbe` 单胜者原子性；失败类型分布只统计最近窗口 |
 | `RetryAndForwardTest` | 传输故障换实例重试、重试次数上限、不可重试只执行一次、TIMEOUT/REFUSED/5xx 区分、无实例/全熔断快速失败 |
 | `IdempotencyDedupTest` | 同键 16 并发只执行一次、异键独立执行、失败键不缓存 |
 | `GatewayIntegrationTest` | 转发流量驱动熔断→OPEN 零调用→半开恢复；半开失败保持熔断；同键 20 并发仅一次下游执行；健康摘除后流量收敛 |
-| `WeightedCapacityTest` | 权重 3:1 精确分摊；并发下在途名额不超发、成功/超时/500 均归还名额不泄漏；满载让份额、空下来自动回归分发 |
+| `WeightedCapacityTest` | 权重 3:1 精确分摊；并发下在途名额不超发、成功/超时/500 均归还名额不泄漏；满载让份额、空下来自动回归分发；**已存在实例调大权重/并发上限立即生效、流量按新权重分摊** |
 | `RetryBudgetTest` | 窗口内预算耗尽只拦重试不拦首发、占比上限、窗口滑过后自动恢复、32 并发抢预算不超发 |
-| `CircuitRecoveryChainTest` | 熔断→冷却→经权重/容量筛选后真实探测→恢复接流量；探测失败重新计时；探测窗口内并发不一拥而上；只读视图不触发翻牌 |
+| `CircuitRecoveryChainTest` | 熔断→冷却→经权重/容量筛选后真实探测→恢复接流量；探测失败重新计时且新冷却期内零探测；探测窗口内并发不一拥而上；只读视图不触发翻牌；**多实例同时冷却到点时每个实例恰好一次真实探测并各自独立恢复；低权重实例冷却到点仍被真实探测；失败类型分布为最近窗口口径** |
 
 测试与主流程均通过 SLF4J 打印**输入、选择结果与判定依据**，例如：
 
@@ -219,8 +229,8 @@ lb input: service=svc, policy=WEIGHTED_ROUND_ROBIN, available=2, excluded=[] -> 
   (basis: smooth WRR [i1(w=5,cur=5) i2(w=1,cur=1)], winner cur=5 -= totalWeight=6)
 lb skip: service=svc, instance=i1 reason=CAPACITY_FULL (inFlight=1/max=1), its weight share goes to remaining instances
 probe result: instance=i1 -> CONNECTION_REFUSED; decision=EVICT(reached 3 consecutive failures, ...)
-circuit[i1] OPEN -> HALF_OPEN: elapsed=2000ms >= openMillis=2000ms, exactly ONE trial request allowed
-probe priority: instance=i1 just flipped OPEN->HALF_OPEN, selected as the single trial request
+circuit[i1] OPEN -> HALF_OPEN: probe acquired at elapsed=2000ms >= openMillis=2000ms, exactly ONE trial request allowed
+probe priority: instance=i1 cooldown elapsed, probe acquired atomically, selected as the single trial request (inFlight=1/unlimited), weight=1 ignored for probes
 retry budget decision: service=svc -> DENY (retry budget exhausted: retries=2/2 within window=10000ms; ...)
 retry decision: failure=CONNECTION_REFUSED is transport-retriable, attempt 1/3 used, backoff=50ms, ...
 forward outcome: service=svc -> FAILED type=RETRY_EXHAUSTED, reason=retry budget exhausted ...
@@ -242,6 +252,11 @@ curl -X POST "$B/register?count=3"
 
 # 1b) 灰度放量：注册一个权重 5、并发上限 2 的实例
 curl -X POST "$B/instances/inst-4/register?weight=5&maxConcurrency=2"
+
+# 1c) 调整已存在实例：权重/并发上限在原实例上立即生效
+#     （响应中 newlyRegistered=false、updatedExisting=true，回显为生效后的真实值；
+#      后续转发流量按新权重分摊，可对比调整前后 /demo/state 的调用计数）
+curl -X POST "$B/instances/inst-4/register?weight=9&maxConcurrency=4"
 
 # 2) 正常转发（加权轮询；全部权重为 1 时等同普通轮询）
 curl -X POST "$B/forward" -H 'Content-Type: application/json' \
@@ -268,9 +283,24 @@ curl -X POST "$B/forward" -H 'Content-Type: application/json' \
 # 8) 查看注册中心、熔断状态与各实例下游调用计数
 curl "$B/state"
 
-# 9) 只读运行状态视图：熔断/探测中/失败类型分布/熔断与满载跳过累计/在途名额
+# 9) 只读运行状态视图：熔断/探测中/最近窗口失败类型分布/熔断与满载跳过累计/在途名额
 #    （查看本身不改变任何状态，可反复调用）
 curl "$B/status"
+
+# 10) 多实例同时恢复验证：把多个实例同时置为 REFUSE，等它们全部熔断
+#     （连续真实调用失败 3 次）后恢复 NORMAL，冷却 2 秒到期再发若干请求——
+#     每个实例都会各自收到一次真实探测并独立恢复（/demo/status 中不会有人
+#     长期停在 probing=true），日志可见每个实例的 "probe acquired" 与
+#     "HALF_OPEN -> CLOSED" 各出现一次
+curl -X POST "$B/instances/inst-1/mode?mode=REFUSE"
+curl -X POST "$B/instances/inst-2/mode?mode=REFUSE"
+# ... 发若干请求直至 /demo/status 显示两者 OPEN ...
+curl -X POST "$B/instances/inst-1/mode?mode=NORMAL"
+curl -X POST "$B/instances/inst-2/mode?mode=NORMAL"
+sleep 2   # 等冷却到期
+curl -X POST "$B/forward" -H 'Content-Type: application/json' -d '{"payload":"r1","retryable":false}'
+curl -X POST "$B/forward" -H 'Content-Type: application/json' -d '{"payload":"r2","retryable":false}'
+curl "$B/status"   # 两者均 CLOSED，failureTypeDistribution 只含最近 60s 内的失败
 ```
 
 `ForwardOutcome` 的每一次返回都包含 `success / response / failureType / reason /
@@ -288,6 +318,7 @@ attempts`（每次尝试的实例、序号、结果），可直接看到选择�
 | 熔断 `failureThreshold` | 3 | 连续真实调用失败多少次熔断 |
 | `openMillis` | 2000ms | 熔断冷却，到期进入半开探测 |
 | `trialSuccessRequired` | 1 | 半开连续成功几次恢复 |
+| `failureWindowMillis` | 60000ms | 状态视图失败类型分布的统计窗口（最近口径） |
 | 重试 `maxAttempts` | 3 | 含首次在内的最大尝试次数 |
 | `backoffMillis` | 50ms | 线性退避基数 |
 | 注册 `weight` | 1 | 灰度权重（平滑加权轮询的分摊比例） |

@@ -54,16 +54,24 @@ public class DemoController {
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 
-    /** 单独注册/调整一个实例的权重与并发上限（灰度放量入口）。 */
+    /**
+     * 单独注册/调整一个实例的权重与并发上限（灰度放量入口）。
+     * 实例不存在时新建；已存在时在原实例上生效新值（newlyRegistered=false、
+     * updatedExisting=true），后续流量分摊与容量判定立即按新值执行。
+     */
     @PostMapping("/instances/{id}/register")
     public Map<String, Object> registerOne(@PathVariable String id,
                                            @RequestParam(defaultValue = "1") int weight,
                                            @RequestParam(defaultValue = "0") int maxConcurrency) {
         boolean created = registry.register(DiscoveryConfig.DEMO_SERVICE, id, weight, maxConcurrency);
         downstream.setMode(id, SimulatedDownstream.Mode.NORMAL);
+        var instance = registry.getInstance(DiscoveryConfig.DEMO_SERVICE, id);
         return Map.of("instance", id, "newlyRegistered", created,
-                "weight", weight,
-                "maxConcurrency", maxConcurrency <= 0 ? "unlimited" : maxConcurrency,
+                "updatedExisting", !created,
+                "weight", instance == null ? weight : instance.weight(),
+                "maxConcurrency", instance == null
+                        ? (maxConcurrency <= 0 ? "unlimited" : maxConcurrency)
+                        : (instance.maxConcurrency() <= 0 ? "unlimited" : instance.maxConcurrency()),
                 "snapshot", registry.snapshot(DiscoveryConfig.DEMO_SERVICE));
     }
 

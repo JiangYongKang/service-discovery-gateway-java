@@ -26,8 +26,12 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
     private int consecutiveFailures = 0;
     private int halfOpenSuccesses = 0;
     private long openedAtMillis = 0L;
-    private final java.util.EnumMap<FailureType, Integer> failureTypeCounts =
-            new java.util.EnumMap<>(FailureType.class);
+    /** 失败事件流水（时间戳+类型）：失败类型分布按最近窗口统计，而非只增累计。 */
+    private final java.util.Deque<FailureEvent> failureEvents = new java.util.ArrayDeque<>();
+
+    /** 一次带类型的失败事件。 */
+    private record FailureEvent(long atMillis, FailureType type) {
+    }
 
     public DefaultCircuitBreaker(String instanceId, CircuitBreakerConfig config) {
         this.instanceId = instanceId;
@@ -76,6 +80,27 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
     }
 
     @Override
+    public synchronized boolean probeDue(long now) {
+        // 只读：不翻牌、不改计时，供转发层先把“冷却到点”的实例列为探测候选
+        return state == CircuitState.OPEN && now - openedAtMillis >= config.openMillis();
+    }
+
+    @Override
+    public synchronized boolean tryAcquireProbe(long now) {
+        // 原子翻牌：同一探测窗口内并发调用只有一个拿到 true，
+        // 拿到探测权的调用方才允许把状态推进到 HALF_OPEN 并真实发出探测
+        if (!probeDue(now)) {
+            return false;
+        }
+        state = CircuitState.HALF_OPEN;
+        halfOpenSuccesses = 0;
+        log.info("circuit[{}] OPEN -> HALF_OPEN: probe acquired at elapsed={}ms >= openMillis={}ms, "
+                + "exactly ONE trial request allowed", instanceId, now - openedAtMillis,
+                config.openMillis());
+        return true;
+    }
+
+    @Override
     public synchronized void recordSuccess(long now) {
         if (state == CircuitState.HALF_OPEN) {
             halfOpenSuccesses++;
@@ -103,7 +128,8 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
     @Override
     public synchronized void recordFailure(long now, FailureType type) {
         if (type != null) {
-            failureTypeCounts.merge(type, 1, Integer::sum);
+            failureEvents.addLast(new FailureEvent(now, type));
+            pruneFailureEvents(now);
         }
         if (state == CircuitState.HALF_OPEN) {
             // 半开探测失败：保持熔断，重新计时
@@ -126,10 +152,29 @@ public class DefaultCircuitBreaker implements CircuitBreaker {
         }
     }
 
-    /** 只读：失败类型分布快照（拷贝，不影响内部状态）。 */
+    /**
+     * 只读：最近 failureWindowMillis 内的失败类型分布快照（拷贝）。
+     * 只统计窗口内事件，不在读取路径上做任何清理/状态修改——
+     * 查看视图本身不改变熔断状态、探测节奏与统计内容。
+     */
     @Override
-    public synchronized java.util.Map<FailureType, Integer> failureTypeDistribution() {
-        return java.util.Collections.unmodifiableMap(new java.util.EnumMap<>(failureTypeCounts));
+    public synchronized java.util.Map<FailureType, Integer> failureTypeDistribution(long now) {
+        java.util.EnumMap<FailureType, Integer> counts = new java.util.EnumMap<>(FailureType.class);
+        long cutoff = now - config.failureWindowMillis();
+        for (FailureEvent event : failureEvents) {
+            if (event.atMillis() >= cutoff) {
+                counts.merge(event.type(), 1, Integer::sum);
+            }
+        }
+        return java.util.Collections.unmodifiableMap(counts);
+    }
+
+    /** 写入路径上顺手清理滑出窗口的历史事件，控制内存占用（不影响状态机）。 */
+    private void pruneFailureEvents(long now) {
+        long cutoff = now - config.failureWindowMillis();
+        while (!failureEvents.isEmpty() && failureEvents.peekFirst().atMillis() < cutoff) {
+            failureEvents.pollFirst();
+        }
     }
 
     /** 测试辅助：直接置为 OPEN 并开始计时。 */

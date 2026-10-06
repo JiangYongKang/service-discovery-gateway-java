@@ -66,8 +66,14 @@ public class InMemoryServiceRegistry implements ServiceRegistry {
                     maxConcurrency <= 0 ? "unlimited" : maxConcurrency);
             return true;
         }
-        log.info("register input: service={}, instance={} -> result=IGNORED(already exists,status={})",
-                serviceName, instanceId, created.status());
+        log.info("register input: service={}, instance={}, weight={}, maxConcurrency={} -> "
+                        + "result=UPDATED(existing instance reconfigured, status={}); "
+                        + "traffic split follows the new values from the next selection round",
+                serviceName, instanceId, Math.max(1, weight),
+                maxConcurrency <= 0 ? "unlimited" : maxConcurrency, created.status());
+        // 已存在实例：权重与并发上限的调整必须真正生效（灰度放量语义），
+        // 而不是回显入参却沿用旧值
+        created.updateCapacity(weight, maxConcurrency);
         return false;
     }
 

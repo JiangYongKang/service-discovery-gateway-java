@@ -38,8 +38,9 @@ public class DiscoveryConfig {
 
     @Bean
     public CircuitBreakerConfig circuitBreakerConfig() {
-        // 连续 3 次真实调用失败熔断；熔断 2 秒后半开；半开探测 1 次成功即恢复
-        return new CircuitBreakerConfig(3, 2000, 1);
+        // 连续 3 次真实调用失败熔断；熔断 2 秒后半开；半开探测 1 次成功即恢复；
+        // 状态视图的失败类型分布按最近 60 秒窗口统计（不是自启动以来的累计）
+        return new CircuitBreakerConfig(3, 2000, 1, 60_000);
     }
 
     @Bean
